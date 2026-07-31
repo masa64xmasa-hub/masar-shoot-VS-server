@@ -1,0 +1,15 @@
+{
+  "name": "masar-shoot-vs-server",
+  "version": "1.0.0",
+  "description": "MASAR SHOOT VS のオンライン対戦・掲示板・個人チャット用サーバー（オフライン配信対応）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
