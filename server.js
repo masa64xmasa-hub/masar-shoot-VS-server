@@ -29,7 +29,10 @@ function loadData() {
     const parsed = JSON.parse(raw);
     return {
       publicHistory: Array.isArray(parsed.publicHistory) ? parsed.publicHistory : [],
-      dmQueues: parsed.dmQueues && typeof parsed.dmQueues === 'object' ? parsed.dmQueues : {}
+      dmQueues: parsed.dmQueues && typeof parsed.dmQueues === 'object' ? parsed.dmQueues : {},
+      stageRecord: parsed.stageRecord && typeof parsed.stageRecord === 'object'
+        ? parsed.stageRecord
+        : { stage: 0, name: '' }
     };
   } catch (e) {
     return { publicHistory: [], dmQueues: {} };
@@ -144,12 +147,15 @@ wss.on('connection', (ws) => {
     // ここで、オフラインの間に溜まっていたDMと、掲示板の履歴をまとめて送り返す
     if (data.messageType === 'identify' && data.senderFriendCode) {
       registerSocket(ws, data.senderFriendCode);
-
       // 💡 掲示板の履歴を配信（1週間以内の投稿すべて）
       for (const historyMsg of store.publicHistory) {
         sendJSON(ws, historyMsg);
       }
-
+       sendJSON(ws, {
+        messageType: 'stage_record_update',
+        recordStage: store.stageRecord.stage,
+        recordHolderName: store.stageRecord.name
+      });
       // 💡 このフレンドコード宛に溜まっていたDMを配信し、届けたらキューから削除する
       const queued = store.dmQueues[data.senderFriendCode];
       if (queued && queued.length > 0) {
@@ -206,6 +212,26 @@ wss.on('connection', (ws) => {
       }
       // 宛先が特定できない場合は今までどおり全員に流す（フォールバック）
       broadcastToAll(data, ws);
+      return;
+    }
+
+    // ─── ステージバトルの新記録を報告 ───
+    if (data.messageType === 'stage_record_submit') {
+      const stage = data.recordStage;
+      const name = (data.recordHolderName || '名無し').toString().slice(0, 20);
+      if (typeof stage === 'number' && stage > (store.stageRecord.stage || 0)) {
+        store.stageRecord = { stage, name };
+        scheduleSave();
+        // 全員（送信者含む）に新しい世界記録を通知し、リアルタイムで表示を更新させる
+        const updateMsg = {
+          messageType: 'stage_record_update',
+          recordStage: store.stageRecord.stage,
+          recordHolderName: store.stageRecord.name
+        };
+        wss.clients.forEach((client) => {
+          if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(updateMsg));
+        });
+      }
       return;
     }
 
