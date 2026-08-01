@@ -8,6 +8,7 @@
 // ─────────────────────────────────────────────────────────
 
 const WebSocket = require('ws');
+const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
@@ -74,9 +75,25 @@ setInterval(() => {
 }, 60 * 60 * 1000);
 
 // ─── WebSocketサーバー本体 ───
-const wss = new WebSocket.Server({ port: PORT });
-console.log(`✅ サーバー起動：ポート ${PORT}`);
+// ─── HTTPサーバー本体（/health は死活監視用、それ以外はWebSocketにアップグレード） ───
+// 💡 これによりUptimeRobotなどの外部ping（HTTPリクエスト）に応答できるようになり、
+// Renderの無料プランでもスリープしにくくなる
+const httpServer = http.createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('OK');
+    return;
+  }
+  res.writeHead(404);
+  res.end();
+});
 
+// ─── WebSocketサーバー本体（HTTPサーバーに相乗りさせる） ───
+const wss = new WebSocket.Server({ server: httpServer });
+
+httpServer.listen(PORT, () => {
+  console.log(`✅ サーバー起動：ポート ${PORT}（/health で死活監視も受け付けます）`);
+});
 // 接続中のソケットを friendCode で引けるように管理
 // 同じ人が複数端末で開いている可能性も考え、1つのfriendCodeに複数ソケットを許容する
 const socketsByFriendCode = new Map(); // friendCode -> Set<ws>
