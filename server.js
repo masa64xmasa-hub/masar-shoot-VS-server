@@ -221,10 +221,12 @@ wss.on('connection', (ws) => {
       }
       // 宛先が特定できない場合は今までどおり全員に流す（フォールバック）
       broadcastToAll(data, ws);
+      return;
+    }
 
-      // ─── ⑤ 🌍 新規追加：ステージバトルの新記録を報告 ───
+    // ─── ⑤ 🌍 新規追加：ステージバトルの新記録を報告 ───
     if (data.messageType === 'stage_record_submit') {
-      console.log('📨 stage_record_submit を受信:', data.recordStage, data.recordHolderName); // ← 追加
+      console.log('📨 stage_record_submit を受信:', data.recordStage, data.recordHolderName);
       const stage = data.recordStage;
       const name = (data.recordHolderName || '名無し').toString().slice(0, 20);
       // 現在の世界記録より大きいステージ番号の場合のみ更新する（不正な巻き戻しや同値更新を防ぐ）
