@@ -226,7 +226,6 @@ wss.on('connection', (ws) => {
     if (data.messageType === 'stage_record_submit') {
       console.log('📨 stage_record_submit を受信:', data.recordStage, data.recordHolderName); // ← 追加
       const stage = data.recordStage;
-      const stage = data.recordStage;
       const name = (data.recordHolderName || '名無し').toString().slice(0, 20);
       // 現在の世界記録より大きいステージ番号の場合のみ更新する（不正な巻き戻しや同値更新を防ぐ）
       if (typeof stage === 'number' && stage > (store.stageRecord.stage || 0)) {
