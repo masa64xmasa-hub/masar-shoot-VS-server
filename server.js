@@ -5,12 +5,9 @@
 //   - 個人チャット(DM)を、相手がオフラインの間はキューに保存しておき、
 //     相手が次にアプリを開いた（identifyを送ってきた）瞬間にまとめて配信する
 //   - データは data.json に保存し、サーバーが再起動しても残るようにする
-//   - 🌍 【新規追加】ステージバトルの世界記録（最高到達ステージ・記録保持者名）を保存し、
-//     新記録が出るたびに全員へ配信する
 // ─────────────────────────────────────────────────────────
 
 const WebSocket = require('ws');
-const http = require('http'); // 💡 追加：/health エンドポイント（外部ping死活監視用）を提供するために必要
 const fs = require('fs');
 const path = require('path');
 
@@ -25,20 +22,16 @@ const MAX_PUBLIC_HISTORY = 500;
 // ─── 永続化データの読み込み ───
 // publicHistory: 掲示板に投稿された過去メッセージ（配列）
 // dmQueues: { フレンドコード: [そのフレンドコード宛にまだ届けていないDMの配列] }
-// stageRecord: 🌍 新規追加：ステージバトルの世界記録 { stage: 最高到達ステージ番号, name: 記録保持者名 }
 function loadData() {
   try {
     const raw = fs.readFileSync(DATA_FILE, 'utf8');
     const parsed = JSON.parse(raw);
     return {
       publicHistory: Array.isArray(parsed.publicHistory) ? parsed.publicHistory : [],
-      dmQueues: parsed.dmQueues && typeof parsed.dmQueues === 'object' ? parsed.dmQueues : {},
-      stageRecord: parsed.stageRecord && typeof parsed.stageRecord === 'object'
-        ? parsed.stageRecord
-        : { stage: 0, name: '' }
+      dmQueues: parsed.dmQueues && typeof parsed.dmQueues === 'object' ? parsed.dmQueues : {}
     };
   } catch (e) {
-    return { publicHistory: [], dmQueues: {}, stageRecord: { stage: 0, name: '' } };
+    return { publicHistory: [], dmQueues: {} };
   }
 }
 
@@ -72,7 +65,6 @@ function pruneOldData() {
       delete store.dmQueues[code];
     }
   }
-  // 💡 stageRecord は期限の概念がないため間引き対象外（世界記録は上書きされるまで残る）
 }
 
 // 1時間おきに古いデータを掃除する
@@ -81,25 +73,9 @@ setInterval(() => {
   scheduleSave();
 }, 60 * 60 * 1000);
 
-// ─── HTTPサーバー本体（/health は死活監視用、それ以外はWebSocketにアップグレード） ───
-// 💡 これによりUptimeRobotなどの外部ping（HTTPリクエスト）に応答できるようになり、
-// Renderの無料プランでもスリープしにくくなる
-const httpServer = http.createServer((req, res) => {
-  if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('OK');
-    return;
-  }
-  res.writeHead(404);
-  res.end();
-});
-
-// ─── WebSocketサーバー本体（HTTPサーバーに相乗りさせる） ───
-const wss = new WebSocket.Server({ server: httpServer });
-
-httpServer.listen(PORT, () => {
-  console.log(`✅ サーバー起動：ポート ${PORT}（/health で死活監視も受け付けます）`);
-});
+// ─── WebSocketサーバー本体 ───
+const wss = new WebSocket.Server({ port: PORT });
+console.log(`✅ サーバー起動：ポート ${PORT}`);
 
 // 接続中のソケットを friendCode で引けるように管理
 // 同じ人が複数端末で開いている可能性も考え、1つのfriendCodeに複数ソケットを許容する
@@ -156,14 +132,6 @@ wss.on('connection', (ws) => {
       for (const historyMsg of store.publicHistory) {
         sendJSON(ws, historyMsg);
       }
-
-      // 🌍 新規追加：現在のステージバトル世界記録を配信する
-      // （記録がまだ0件でも送っておく。クライアント側は stage > 0 の時だけカードを表示するので問題ない）
-      sendJSON(ws, {
-        messageType: 'stage_record_update',
-        recordStage: store.stageRecord.stage,
-        recordHolderName: store.stageRecord.name
-      });
 
       // 💡 このフレンドコード宛に溜まっていたDMを配信し、届けたらキューから削除する
       const queued = store.dmQueues[data.senderFriendCode];
@@ -224,29 +192,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // ─── ⑤ 🌍 新規追加：ステージバトルの新記録を報告 ───
-    if (data.messageType === 'stage_record_submit') {
-      console.log('📨 stage_record_submit を受信:', data.recordStage, data.recordHolderName);
-      const stage = data.recordStage;
-      const name = (data.recordHolderName || '名無し').toString().slice(0, 20);
-      // 現在の世界記録より大きいステージ番号の場合のみ更新する（不正な巻き戻しや同値更新を防ぐ）
-      if (typeof stage === 'number' && stage > (store.stageRecord.stage || 0)) {
-        store.stageRecord = { stage, name };
-        scheduleSave();
-        // 全員（送信者含む）に新しい世界記録を通知し、リアルタイムで表示を更新させる
-        const updateMsg = {
-          messageType: 'stage_record_update',
-          recordStage: store.stageRecord.stage,
-          recordHolderName: store.stageRecord.name
-        };
-        wss.clients.forEach((client) => {
-          if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(updateMsg));
-        });
-      }
-      return;
-    }
-
-    // ─── ⑥ それ以外（対戦の位置同期・勝敗結果など）は今までどおり全員へブロードキャスト ───
+    // ─── ⑤ それ以外（対戦の位置同期・勝敗結果など）は今までどおり全員へブロードキャスト ───
     broadcastToAll(data, ws);
   });
 
