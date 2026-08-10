@@ -5,6 +5,12 @@
 //   - 個人チャット(DM)を、相手がオフラインの間はキューに保存しておき、
 //     相手が次にアプリを開いた（identifyを送ってきた）瞬間にまとめて配信する
 //   - データは data.json に保存し、サーバーが再起動しても残るようにする
+//   - 🏆【追加】レートランキング：rate_submit を受けたら最新レートを保存し、
+//     leaderboard_request が来たら本人にだけトップ10を返す
+//   - 🏔【修正】ステージ世界記録：今までは stage_record_submit をそのまま
+//     転送するだけで、クライアントが待っている stage_record_update に
+//     変換していなかったため機能していなかった。ここで正しく変換・保存・
+//     全員への配信を行うようにした
 // ─────────────────────────────────────────────────────────
 
 const WebSocket = require('ws');
@@ -18,20 +24,28 @@ const DATA_FILE = path.join(__dirname, 'data.json');
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 // 掲示板の履歴として保持しておく最大件数（増えすぎないように上限を設ける）
 const MAX_PUBLIC_HISTORY = 500;
+// ランキングに載せる人数
+const LEADERBOARD_SIZE = 10;
 
 // ─── 永続化データの読み込み ───
 // publicHistory: 掲示板に投稿された過去メッセージ（配列）
 // dmQueues: { フレンドコード: [そのフレンドコード宛にまだ届けていないDMの配列] }
+// leaderboard: { フレンドコード: { name, rate } } ← そのプレイヤーの最新レート
+// stageRecord: { stage, name } ← ステージバトルの世界記録
 function loadData() {
   try {
     const raw = fs.readFileSync(DATA_FILE, 'utf8');
     const parsed = JSON.parse(raw);
     return {
       publicHistory: Array.isArray(parsed.publicHistory) ? parsed.publicHistory : [],
-      dmQueues: parsed.dmQueues && typeof parsed.dmQueues === 'object' ? parsed.dmQueues : {}
+      dmQueues: parsed.dmQueues && typeof parsed.dmQueues === 'object' ? parsed.dmQueues : {},
+      leaderboard: parsed.leaderboard && typeof parsed.leaderboard === 'object' ? parsed.leaderboard : {},
+      stageRecord: parsed.stageRecord && typeof parsed.stageRecord === 'object'
+        ? parsed.stageRecord
+        : { stage: 0, name: '' }
     };
   } catch (e) {
-    return { publicHistory: [], dmQueues: {} };
+    return { publicHistory: [], dmQueues: {}, leaderboard: {}, stageRecord: { stage: 0, name: '' } };
   }
 }
 
@@ -65,6 +79,8 @@ function pruneOldData() {
       delete store.dmQueues[code];
     }
   }
+  // leaderboard・stageRecord は「現在の最新値」を保持するだけのデータなので
+  // 時間経過では間引かない（次に上書きされるまでずっと有効な記録として残す）
 }
 
 // 1時間おきに古いデータを掃除する
@@ -72,6 +88,24 @@ setInterval(() => {
   pruneOldData();
   scheduleSave();
 }, 60 * 60 * 1000);
+
+// 🔧 Swift側の PlayerData は x/y/direction/isShooting/hp/characterId が必須(非Optional)なので、
+// サーバーから新規に組み立てて送るメッセージには必ずこのダミー値を含めておく必要がある
+function baseFields() {
+  return { x: 0, y: 0, direction: 0, isShooting: false, hp: 0, characterId: '' };
+}
+
+// フレンドコードごとの最新レートから、上位 LEADERBOARD_SIZE 件を組み立てる
+function buildLeaderboardEntries() {
+  return Object.keys(store.leaderboard)
+    .map((code) => ({
+      name: store.leaderboard[code].name,
+      rate: store.leaderboard[code].rate,
+      friendCode: code
+    }))
+    .sort((a, b) => b.rate - a.rate)
+    .slice(0, LEADERBOARD_SIZE);
+}
 
 // ─── WebSocketサーバー本体 ───
 const wss = new WebSocket.Server({ port: PORT });
@@ -142,6 +176,16 @@ wss.on('connection', (ws) => {
         delete store.dmQueues[data.senderFriendCode];
         scheduleSave();
       }
+
+      // 🏔 現在のステージ世界記録があれば、接続直後に送っておく
+      if (store.stageRecord && store.stageRecord.stage > 0) {
+        sendJSON(ws, {
+          ...baseFields(),
+          messageType: 'stage_record_update',
+          recordStage: store.stageRecord.stage,
+          recordHolderName: store.stageRecord.name
+        });
+      }
       return; // identify自体は他のクライアントに転送しない
     }
 
@@ -192,7 +236,50 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // ─── ⑤ それ以外（対戦の位置同期・勝敗結果など）は今までどおり全員へブロードキャスト ───
+    // ─── ⑤ rate_submit：対戦後の最新レートをランキングとして保存する ───
+    // フレンドコードごとに「最新の1件」だけを持つので、同じ人が何度提出しても増殖しない
+    if (data.messageType === 'rate_submit' && data.senderFriendCode) {
+      const rate = typeof data.submittedRate === 'number' ? data.submittedRate : null;
+      if (rate !== null) {
+        store.leaderboard[data.senderFriendCode] = {
+          name: data.playerName || '名無し',
+          rate: rate
+        };
+        scheduleSave();
+      }
+      return; // ランキング提出は他プレイヤーへ転送しない
+    }
+
+    // ─── ⑥ leaderboard_request：トップ10を要求してきた本人にだけ返す ───
+    if (data.messageType === 'leaderboard_request') {
+      sendJSON(ws, {
+        ...baseFields(),
+        messageType: 'leaderboard_update',
+        leaderboardEntries: buildLeaderboardEntries()
+      });
+      return;
+    }
+
+    // ─── ⑦ stage_record_submit：ステージバトルの世界記録を更新する ───
+    // 🔧【修正】以前はここが無く、そのまま⑧の全員ブロードキャストに落ちていたため、
+    // クライアントが待っている stage_record_update に変換されず機能していなかった
+    if (data.messageType === 'stage_record_submit') {
+      const stage = typeof data.recordStage === 'number' ? data.recordStage : 0;
+      if (stage > (store.stageRecord.stage || 0)) {
+        store.stageRecord = { stage: stage, name: data.recordHolderName || '名無し' };
+        scheduleSave();
+      }
+      // 更新の有無にかかわらず、現在の世界記録を送信者含む全員に配信して表示を最新化する
+      broadcastToAll({
+        ...baseFields(),
+        messageType: 'stage_record_update',
+        recordStage: store.stageRecord.stage,
+        recordHolderName: store.stageRecord.name
+      }, null);
+      return;
+    }
+
+    // ─── ⑧ それ以外（対戦の位置同期・勝敗結果など）は今までどおり全員へブロードキャスト ───
     broadcastToAll(data, ws);
   });
 
