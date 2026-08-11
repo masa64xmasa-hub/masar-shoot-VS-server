@@ -260,6 +260,19 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    // ─── ⑥' leaderboard_reset：【開発者用】保存されているランキングデータを全消去する ───
+    if (data.messageType === 'leaderboard_reset') {
+      store.leaderboard = {};
+      scheduleSave();
+      // リセット後の（空の）ランキングを要求元にだけ返して画面をすぐ更新できるようにする
+      sendJSON(ws, {
+        ...baseFields(),
+        messageType: 'leaderboard_update',
+        leaderboardEntries: []
+      });
+      return;
+    }
+
     // ─── ⑦ stage_record_submit：ステージバトルの世界記録を更新する ───
     // 🔧【修正】以前はここが無く、そのまま⑧の全員ブロードキャストに落ちていたため、
     // クライアントが待っている stage_record_update に変換されず機能していなかった
