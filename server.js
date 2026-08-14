@@ -32,6 +32,7 @@ const LEADERBOARD_SIZE = 10;
 // dmQueues: { フレンドコード: [そのフレンドコード宛にまだ届けていないDMの配列] }
 // leaderboard: { フレンドコード: { name, rate } } ← そのプレイヤーの最新レート
 // stageRecord: { stage, name } ← ステージバトルの世界記録
+// claimedNames: { プレイヤー名: フレンドコード } ← 名前の重複を防ぐための登録簿
 function loadData() {
   try {
     const raw = fs.readFileSync(DATA_FILE, 'utf8');
@@ -42,10 +43,11 @@ function loadData() {
       leaderboard: parsed.leaderboard && typeof parsed.leaderboard === 'object' ? parsed.leaderboard : {},
       stageRecord: parsed.stageRecord && typeof parsed.stageRecord === 'object'
         ? parsed.stageRecord
-        : { stage: 0, name: '' }
+        : { stage: 0, name: '' },
+      claimedNames: parsed.claimedNames && typeof parsed.claimedNames === 'object' ? parsed.claimedNames : {}
     };
   } catch (e) {
-    return { publicHistory: [], dmQueues: {}, leaderboard: {}, stageRecord: { stage: 0, name: '' } };
+    return { publicHistory: [], dmQueues: {}, leaderboard: {}, stageRecord: { stage: 0, name: '' }, claimedNames: {} };
   }
 }
 
@@ -187,6 +189,33 @@ wss.on('connection', (ws) => {
         });
       }
       return; // identify自体は他のクライアントに転送しない
+    }
+
+    // ─── ①' claim_name：プレイヤー名の重複を防ぐための登録リクエスト ───
+    // 同じ名前をすでに「別のフレンドコード」が使っていたら拒否し、空いていれば登録して確保する
+    if (data.messageType === 'claim_name' && data.senderFriendCode) {
+      const desired = typeof data.playerName === 'string' ? data.playerName.trim() : '';
+      if (!desired) {
+        sendJSON(ws, { ...baseFields(), messageType: 'name_claim_result', playerName: desired, nameAvailable: false });
+        return;
+      }
+
+      const owner = store.claimedNames[desired];
+      if (owner && owner !== data.senderFriendCode) {
+        // 既に他の人が使用中
+        sendJSON(ws, { ...baseFields(), messageType: 'name_claim_result', playerName: desired, nameAvailable: false });
+        return;
+      }
+
+      // 同じ人が以前確保していた名前があれば解放してから、新しい名前を確保する
+      for (const key of Object.keys(store.claimedNames)) {
+        if (store.claimedNames[key] === data.senderFriendCode) delete store.claimedNames[key];
+      }
+      store.claimedNames[desired] = data.senderFriendCode;
+      scheduleSave();
+
+      sendJSON(ws, { ...baseFields(), messageType: 'name_claim_result', playerName: desired, nameAvailable: true });
+      return;
     }
 
     // ─── ② public_chat：掲示板への投稿 ───
