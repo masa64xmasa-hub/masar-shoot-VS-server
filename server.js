@@ -109,6 +109,73 @@ function buildLeaderboardEntries() {
     .slice(0, LEADERBOARD_SIZE);
 }
 
+// ─── 🥊 マッチメイキング ───
+// レートの近い者同士をペアリングし、「ルーム」という単位に分けて、その2人だけの通信に絞る。
+// これにより複数組が同時にオンライン対戦していても、他の組の通信が混ざらなくなる。
+const matchmakingQueue = []; // { ws, friendCode, name, rate, joinedAt }
+const socketsByRoom = new Map(); // roomId -> Set<ws>
+
+function generateRoomId() {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+function removeFromQueue(ws) {
+  for (let i = matchmakingQueue.length - 1; i >= 0; i--) {
+    if (matchmakingQueue[i].ws === ws) matchmakingQueue.splice(i, 1);
+  }
+}
+
+function leaveRoom(ws) {
+  if (ws.roomId && socketsByRoom.has(ws.roomId)) {
+    socketsByRoom.get(ws.roomId).delete(ws);
+    if (socketsByRoom.get(ws.roomId).size === 0) {
+      socketsByRoom.delete(ws.roomId);
+    }
+  }
+  ws.roomId = null;
+}
+
+// 待機時間が長いほど許容するレート差を広げていく（すぐ見つかる時は近いレート、なかなか見つからない時は広めに探す）
+function attemptMatchmaking() {
+  const now = Date.now();
+  for (let i = 0; i < matchmakingQueue.length; i++) {
+    const a = matchmakingQueue[i];
+    if (a.ws.readyState !== WebSocket.OPEN) continue;
+    const threshold = 80 + Math.floor((now - a.joinedAt) / 2000) * 60;
+
+    let bestIndex = -1;
+    let bestDiff = Infinity;
+    for (let j = 0; j < matchmakingQueue.length; j++) {
+      if (i === j) continue;
+      const b = matchmakingQueue[j];
+      if (b.ws.readyState !== WebSocket.OPEN) continue;
+      const diff = Math.abs(a.rate - b.rate);
+      if (diff <= threshold && diff < bestDiff) {
+        bestDiff = diff;
+        bestIndex = j;
+      }
+    }
+
+    if (bestIndex !== -1) {
+      const b = matchmakingQueue[bestIndex];
+      const roomId = generateRoomId();
+      removeFromQueue(a.ws);
+      removeFromQueue(b.ws);
+      a.ws.roomId = roomId;
+      b.ws.roomId = roomId;
+      socketsByRoom.set(roomId, new Set([a.ws, b.ws]));
+      sendJSON(a.ws, { ...baseFields(), messageType: 'match_found', roomId, playerName: b.name, submittedRate: b.rate });
+      sendJSON(b.ws, { ...baseFields(), messageType: 'match_found', roomId, playerName: a.name, submittedRate: a.rate });
+      // キューの中身が変わったので最初からやり直す
+      attemptMatchmaking();
+      return;
+    }
+  }
+}
+
+// 誰かが長時間キューで待っている場合に備えて、定期的にも再挑戦する
+setInterval(attemptMatchmaking, 2000);
+
 // ─── WebSocketサーバー本体 ───
 const wss = new WebSocket.Server({ port: PORT });
 console.log(`✅ サーバー起動：ポート ${PORT}`);
@@ -321,11 +388,42 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // ─── ⑧ それ以外（対戦の位置同期・勝敗結果など）は今までどおり全員へブロードキャスト ───
-    broadcastToAll(data, ws);
+    // ─── ⑦' find_match：マッチメイキングのキューに参加する ───
+    if (data.messageType === 'find_match' && data.senderFriendCode) {
+      removeFromQueue(ws); // 二重登録防止
+      leaveRoom(ws); // 前の対戦の部屋に入ったままなら抜けておく
+      matchmakingQueue.push({
+        ws,
+        friendCode: data.senderFriendCode,
+        name: data.playerName || '名無し',
+        rate: typeof data.submittedRate === 'number' ? data.submittedRate : 1500,
+        joinedAt: Date.now()
+      });
+      attemptMatchmaking();
+      return;
+    }
+
+    // ─── ⑦'' cancel_match：マッチメイキングを取りやめる ───
+    if (data.messageType === 'cancel_match') {
+      removeFromQueue(ws);
+      return;
+    }
+
+    // ─── ⑧ それ以外（対戦の位置同期・勝敗結果など）は、マッチング済みの「同じ部屋の相手」にだけ送る ───
+    // 🔧【修正】以前は接続者全員へブロードキャストしていたため、3人以上が同時にオンライン対戦を
+    // 開始すると、無関係な相手の操作情報が混ざってしまう問題があった。マッチメイキング導入に伴い、
+    // ペアリングされた2人だけの部屋（ルーム）に閉じて送るように変更した
+    if (ws.roomId && socketsByRoom.has(ws.roomId)) {
+      const peers = socketsByRoom.get(ws.roomId);
+      peers.forEach((peer) => {
+        if (peer !== ws && peer.readyState === WebSocket.OPEN) peer.send(JSON.stringify(data));
+      });
+    }
   });
 
   ws.on('close', () => {
     unregisterSocket(ws);
+    removeFromQueue(ws);
+    leaveRoom(ws);
   });
 });
