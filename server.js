@@ -33,6 +33,7 @@ const LEADERBOARD_SIZE = 10;
 // leaderboard: { フレンドコード: { name, rate } } ← そのプレイヤーの最新レート
 // stageRecord: { stage, name } ← ステージバトルの世界記録
 // claimedNames: { プレイヤー名: フレンドコード } ← 名前の重複を防ぐための登録簿
+// charStats: { キャラID: { wins, losses } } ← 【追加】バランス調整用のキャラ別勝敗集計（オンライン対戦のみ）
 function loadData() {
   try {
     const raw = fs.readFileSync(DATA_FILE, 'utf8');
@@ -44,10 +45,11 @@ function loadData() {
       stageRecord: parsed.stageRecord && typeof parsed.stageRecord === 'object'
         ? parsed.stageRecord
         : { stage: 0, name: '' },
-      claimedNames: parsed.claimedNames && typeof parsed.claimedNames === 'object' ? parsed.claimedNames : {}
+      claimedNames: parsed.claimedNames && typeof parsed.claimedNames === 'object' ? parsed.claimedNames : {},
+      charStats: parsed.charStats && typeof parsed.charStats === 'object' ? parsed.charStats : {}
     };
   } catch (e) {
-    return { publicHistory: [], dmQueues: {}, leaderboard: {}, stageRecord: { stage: 0, name: '' }, claimedNames: {} };
+    return { publicHistory: [], dmQueues: {}, leaderboard: {}, stageRecord: { stage: 0, name: '' }, claimedNames: {}, charStats: {} };
   }
 }
 
@@ -366,6 +368,48 @@ wss.on('connection', (ws) => {
         messageType: 'leaderboard_update',
         leaderboardEntries: []
       });
+      return;
+    }
+
+    // ─── ⑥'' char_stat_submit：【バランス調整用】オンライン対戦の勝敗をキャラ別に集計する ───
+    if (data.messageType === 'char_stat_submit' && data.characterId) {
+      const charId = data.characterId;
+      if (!store.charStats[charId]) store.charStats[charId] = { wins: 0, losses: 0 };
+      if (data.matchResult === 'win') {
+        store.charStats[charId].wins += 1;
+      } else {
+        store.charStats[charId].losses += 1;
+      }
+      scheduleSave();
+      return; // 集計は他プレイヤーへ転送しない
+    }
+
+    // ─── ⑥''' char_stats_request：【開発者用】キャラ別勝率の集計結果を返す ───
+    if (data.messageType === 'char_stats_request') {
+      const entries = Object.keys(store.charStats).map((id) => {
+        const s = store.charStats[id];
+        const total = s.wins + s.losses;
+        return {
+          characterId: id,
+          wins: s.wins,
+          losses: s.losses,
+          winRate: total > 0 ? Math.round((s.wins / total) * 1000) / 10 : 0
+        };
+      }).sort((a, b) => (b.wins + b.losses) - (a.wins + a.losses));
+
+      sendJSON(ws, {
+        ...baseFields(),
+        messageType: 'char_stats_update',
+        charStatsJSON: JSON.stringify(entries)
+      });
+      return;
+    }
+
+    // ─── ⑥'''' char_stats_reset：【開発者用】キャラ別勝率の集計を全消去する ───
+    if (data.messageType === 'char_stats_reset') {
+      store.charStats = {};
+      scheduleSave();
+      sendJSON(ws, { ...baseFields(), messageType: 'char_stats_update', charStatsJSON: '[]' });
       return;
     }
 
