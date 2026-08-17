@@ -16,6 +16,7 @@
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const PORT = process.env.PORT || 10000;
 const DATA_FILE = path.join(__dirname, 'data.json');
@@ -34,6 +35,7 @@ const LEADERBOARD_SIZE = 10;
 // stageRecord: { stage, name } ← ステージバトルの世界記録
 // claimedNames: { プレイヤー名: フレンドコード } ← 名前の重複を防ぐための登録簿
 // charStats: { キャラID: { wins, losses } } ← 【追加】バランス調整用のキャラ別勝敗集計（オンライン対戦のみ）
+// accounts: { ユーザー名: { salt, hash, data } } ← 【追加】ログイン式データ同期用のアカウント（dataはJSON文字列）
 function loadData() {
   try {
     const raw = fs.readFileSync(DATA_FILE, 'utf8');
@@ -46,10 +48,11 @@ function loadData() {
         ? parsed.stageRecord
         : { stage: 0, name: '' },
       claimedNames: parsed.claimedNames && typeof parsed.claimedNames === 'object' ? parsed.claimedNames : {},
-      charStats: parsed.charStats && typeof parsed.charStats === 'object' ? parsed.charStats : {}
+      charStats: parsed.charStats && typeof parsed.charStats === 'object' ? parsed.charStats : {},
+      accounts: parsed.accounts && typeof parsed.accounts === 'object' ? parsed.accounts : {}
     };
   } catch (e) {
-    return { publicHistory: [], dmQueues: {}, leaderboard: {}, stageRecord: { stage: 0, name: '' }, claimedNames: {}, charStats: {} };
+    return { publicHistory: [], dmQueues: {}, leaderboard: {}, stageRecord: { stage: 0, name: '' }, claimedNames: {}, charStats: {}, accounts: {} };
   }
 }
 
@@ -97,6 +100,16 @@ setInterval(() => {
 // サーバーから新規に組み立てて送るメッセージには必ずこのダミー値を含めておく必要がある
 function baseFields() {
   return { x: 0, y: 0, direction: 0, isShooting: false, hp: 0, characterId: '' };
+}
+
+// 🔐 ログイン式データ同期用：パスワードはランダムなsaltを付けてハッシュ化してから保存する
+// （平文のまま保存しない。scryptは追加パッケージ不要でNode標準に入っている）
+function hashPassword(password, salt) {
+  return crypto.scryptSync(password, salt, 64).toString('hex');
+}
+
+function generateSalt() {
+  return crypto.randomBytes(16).toString('hex');
 }
 
 // フレンドコードごとの最新レートから、上位 LEADERBOARD_SIZE 件を組み立てる
@@ -410,6 +423,53 @@ wss.on('connection', (ws) => {
       store.charStats = {};
       scheduleSave();
       sendJSON(ws, { ...baseFields(), messageType: 'char_stats_update', charStatsJSON: '[]' });
+      return;
+    }
+
+    // ─── ⑥⑤ account_register：ログイン用アカウントを新規作成する ───
+    if (data.messageType === 'account_register') {
+      const username = (data.playerName || '').trim();
+      const password = data.authPassword || '';
+      if (!username || password.length < 4) {
+        sendJSON(ws, { ...baseFields(), messageType: 'account_auth_result', playerName: username, authSuccess: false, authFailReason: 'invalid' });
+        return;
+      }
+      if (store.accounts[username]) {
+        sendJSON(ws, { ...baseFields(), messageType: 'account_auth_result', playerName: username, authSuccess: false, authFailReason: 'taken' });
+        return;
+      }
+      const salt = generateSalt();
+      store.accounts[username] = {
+        salt,
+        hash: hashPassword(password, salt),
+        data: data.accountDataJSON || '{}'
+      };
+      scheduleSave();
+      sendJSON(ws, { ...baseFields(), messageType: 'account_auth_result', playerName: username, authSuccess: true, accountDataJSON: store.accounts[username].data });
+      return;
+    }
+
+    // ─── ⑥⑥ account_login：既存アカウントにログインし、保存済みデータを受け取る ───
+    if (data.messageType === 'account_login') {
+      const username = (data.playerName || '').trim();
+      const password = data.authPassword || '';
+      const account = store.accounts[username];
+      if (!account || hashPassword(password, account.salt) !== account.hash) {
+        sendJSON(ws, { ...baseFields(), messageType: 'account_auth_result', playerName: username, authSuccess: false, authFailReason: 'invalid_credentials' });
+        return;
+      }
+      sendJSON(ws, { ...baseFields(), messageType: 'account_auth_result', playerName: username, authSuccess: true, accountDataJSON: account.data });
+      return;
+    }
+
+    // ─── ⑥⑦ account_sync_push：ログイン中のアカウントに最新のセーブデータを反映する ───
+    if (data.messageType === 'account_sync_push') {
+      const username = (data.playerName || '').trim();
+      const password = data.authPassword || '';
+      const account = store.accounts[username];
+      if (!account || hashPassword(password, account.salt) !== account.hash) return; // 認証が通らなければ黙って無視
+      account.data = data.accountDataJSON || account.data;
+      scheduleSave();
       return;
     }
 
