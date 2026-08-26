@@ -6,7 +6,7 @@
 //     相手が次にアプリを開いた（identifyを送ってきた）瞬間にまとめて配信する
 //   - データは data.json に保存し、サーバーが再起動しても残るようにする
 //   - 🏆【追加】レートランキング：rate_submit を受けたら最新レートを保存し、
-//     leaderboard_request が来たら本人にだけトップ10を返す
+//     leaderboard_request が来たら本人にだけトップ100を返す
 //   - 🏔【修正】ステージ世界記録：今までは stage_record_submit をそのまま
 //     転送するだけで、クライアントが待っている stage_record_update に
 //     変換していなかったため機能していなかった。ここで正しく変換・保存・
@@ -26,7 +26,7 @@ const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 // 掲示板の履歴として保持しておく最大件数（増えすぎないように上限を設ける）
 const MAX_PUBLIC_HISTORY = 500;
 // ランキングに載せる人数
-const LEADERBOARD_SIZE = 10;
+const LEADERBOARD_SIZE = 100;
 
 // ─── 永続化データの読み込み ───
 // publicHistory: 掲示板に投稿された過去メッセージ（配列）
@@ -361,7 +361,7 @@ wss.on('connection', (ws) => {
       return; // ランキング提出は他プレイヤーへ転送しない
     }
 
-    // ─── ⑥ leaderboard_request：トップ10を要求してきた本人にだけ返す ───
+    // ─── ⑥ leaderboard_request：トップ100を要求してきた本人にだけ返す ───
     if (data.messageType === 'leaderboard_request') {
       sendJSON(ws, {
         ...baseFields(),
