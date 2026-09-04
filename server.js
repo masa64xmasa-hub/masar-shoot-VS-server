@@ -19,7 +19,11 @@ const path = require('path');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 10000;
-const DATA_FILE = path.join(__dirname, 'data.json');
+// 🔧【Fly.io対応】Fly.ioのコンテナは再デプロイ・再起動のたびにファイルシステムがリセットされるため、
+// data.jsonをそのままアプリのフォルダに置くと、デプロイの度にランキング・掲示板履歴などが消えてしまう。
+// DATA_FILE環境変数（fly.tomlで永続ボリュームのマウント先を指定）が設定されていればそちらを使い、
+// 未設定（ローカルでの開発時など）は今まで通りアプリのフォルダ内に保存する。
+const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
 
 // メッセージの保持期間（クライアント側の「1週間保存」と合わせている）
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -54,6 +58,14 @@ function loadData() {
   } catch (e) {
     return { publicHistory: [], dmQueues: {}, leaderboard: {}, stageRecord: { stage: 0, name: '' }, claimedNames: {}, charStats: {}, accounts: {} };
   }
+}
+
+// 🔧【Fly.io対応】マウントしたボリューム側のディレクトリがまだ無い場合に備えて、
+// 保存先フォルダを先に作っておく（ローカルの__dirnameは元々存在するので影響なし）
+try {
+  fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+} catch (e) {
+  // 既に存在する場合などは無視して問題ない
 }
 
 let store = loadData();
@@ -191,9 +203,152 @@ function attemptMatchmaking() {
 // 誰かが長時間キューで待っている場合に備えて、定期的にも再挑戦する
 setInterval(attemptMatchmaking, 2000);
 
+// ─── ⚔️ レイドバトル：最大4人までがオンラインで協力し、1体の強力なボスに挑む ───
+// 🥊のレートバトルとは別の、独立した「部屋」の仕組みとして実装する。
+// ボスのHPと各プレイヤーのHPはサーバー側だけが正としてを持ち（クライアントはただ表示するだけ）、
+// 各クライアントが勝手にボスHPを計算して食い違う、といったズレが起きないようにしている。
+const RAID_MAX_PARTY = 4;
+const RAID_QUEUE_WAIT_MS = 8000; // 8秒待って、その時点で集まった人数でスタートする
+const RAID_BOSS_HP_PER_PLAYER = 300;
+const RAID_PLAYER_MAX_HP = 100;
+const RAID_BOSS_ATTACK_INTERVAL_MS = 3000;
+const RAID_ATTACK_COOLDOWN_MS = 800; // 連打防止（クライアント側だけでなくサーバー側でも制限する）
+
+const raidQueue = []; // { ws, friendCode, name, joinedAt }
+const raidRooms = new Map(); // roomId -> { members: Map<friendCode, {ws,name,hp,alive,lastAttackAt}>, bossHp, bossMaxHp, ended, timer }
+
+function generateRaidRoomId() {
+  return 'raid_' + Math.random().toString(36).slice(2, 10);
+}
+
+function removeFromRaidQueue(ws) {
+  for (let i = raidQueue.length - 1; i >= 0; i--) {
+    if (raidQueue[i].ws === ws) raidQueue.splice(i, 1);
+  }
+}
+
+function raidPartyStatusString(room) {
+  return Array.from(room.members.values()).map((m) => `${m.name}:${m.hp}`).join(',');
+}
+
+function broadcastRaidState(roomId) {
+  const room = raidRooms.get(roomId);
+  if (!room) return;
+  const statusString = raidPartyStatusString(room);
+  room.members.forEach((member) => {
+    sendJSON(member.ws, {
+      ...baseFields(),
+      messageType: 'raid_update',
+      roomId,
+      raidBossHp: room.bossHp,
+      raidBossMaxHp: room.bossMaxHp,
+      raidPartyStatus: statusString
+    });
+  });
+}
+
+function endRaidRoom(roomId, won) {
+  const room = raidRooms.get(roomId);
+  if (!room || room.ended) return;
+  room.ended = true;
+  if (room.timer) clearInterval(room.timer);
+
+  const totalCount = room.members.size;
+  // 💰 討伐成功時のみ報酬あり。ボスの最大HP（＝人数に比例）に応じて総報酬を決め、参加人数で山分けする
+  const totalGold = won ? Math.round(200 + room.bossMaxHp * 0.6) : 0;
+  const totalXp = won ? Math.round(150 + room.bossMaxHp * 0.4) : 0;
+  const goldShare = totalCount > 0 ? Math.round(totalGold / totalCount) : 0;
+  const xpShare = totalCount > 0 ? Math.round(totalXp / totalCount) : 0;
+
+  room.members.forEach((member) => {
+    sendJSON(member.ws, {
+      ...baseFields(),
+      messageType: 'raid_result',
+      roomId,
+      raidResult: won ? 'win' : 'lose',
+      raidGoldReward: goldShare,
+      raidXpReward: xpShare
+    });
+    member.ws.raidRoomId = null;
+  });
+
+  raidRooms.delete(roomId);
+}
+
+function startRaidRoom(entries) {
+  const roomId = generateRaidRoomId();
+  const bossMaxHp = RAID_BOSS_HP_PER_PLAYER * entries.length;
+  const members = new Map();
+  entries.forEach((e) => {
+    e.ws.raidRoomId = roomId;
+    members.set(e.friendCode, { ws: e.ws, name: e.name, hp: RAID_PLAYER_MAX_HP, alive: true, lastAttackAt: 0 });
+  });
+  const room = { members, bossHp: bossMaxHp, bossMaxHp, ended: false, timer: null };
+  raidRooms.set(roomId, room);
+
+  members.forEach((member) => {
+    sendJSON(member.ws, {
+      ...baseFields(),
+      messageType: 'raid_start',
+      roomId,
+      raidBossHp: room.bossHp,
+      raidBossMaxHp: room.bossMaxHp,
+      raidPartyStatus: raidPartyStatusString(room)
+    });
+  });
+
+  // 🐲 ボスの攻撃：一定間隔で、生きているメンバーの中からランダムに1人を狙って攻撃する
+  room.timer = setInterval(() => {
+    if (room.ended) { clearInterval(room.timer); return; }
+    const alivePlayers = Array.from(room.members.values()).filter((m) => m.alive);
+    if (alivePlayers.length === 0) {
+      endRaidRoom(roomId, false);
+      return;
+    }
+    const target = alivePlayers[Math.floor(Math.random() * alivePlayers.length)];
+    const damage = 10 + Math.floor(Math.random() * 15);
+    target.hp = Math.max(0, target.hp - damage);
+    if (target.hp <= 0) target.alive = false;
+
+    broadcastRaidState(roomId);
+
+    const stillAnyoneAlive = Array.from(room.members.values()).some((m) => m.alive);
+    if (!stillAnyoneAlive) {
+      endRaidRoom(roomId, false);
+    }
+  }, RAID_BOSS_ATTACK_INTERVAL_MS);
+}
+
+// 一定時間待っても集まらなければ、その時点の人数（1人でもOK）でスタートする
+function attemptRaidMatchmaking() {
+  if (raidQueue.length === 0) return;
+  const now = Date.now();
+  const oldest = raidQueue[0];
+  const waited = now - oldest.joinedAt;
+
+  if (raidQueue.length >= RAID_MAX_PARTY || waited >= RAID_QUEUE_WAIT_MS) {
+    const group = raidQueue.splice(0, RAID_MAX_PARTY);
+    startRaidRoom(group);
+  }
+}
+setInterval(attemptRaidMatchmaking, 1000);
+
 // ─── WebSocketサーバー本体 ───
-const wss = new WebSocket.Server({ port: PORT });
-console.log(`✅ サーバー起動：ポート ${PORT}`);
+// 🔧【修正】以前は new WebSocket.Server({ port: PORT }) だけで、WebSocketの通信にしか
+// 応答できなかった。そのためFly.ioが定期的に行う「普通のHTTPアクセスでの生存確認
+// （ヘルスチェック）」に対して426(Upgrade Required)を返してしまい、Fly.io側に
+// 「正常に動いていない」と誤判定されて再起動を繰り返される恐れがあった。
+// 先に普通のHTTPサーバーを作って「OK」とだけ返すようにし、WebSocketはその上に
+// 相乗りさせることで、普通のアクセスにもWebSocket接続にも両方正しく応答できるようにした。
+const http = require('http');
+const httpServer = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('MASAR SHOOT VS サーバーは正常に稼働中です。WebSocketで接続してください。');
+});
+const wss = new WebSocket.Server({ server: httpServer });
+httpServer.listen(PORT, () => {
+  console.log(`✅ サーバー起動：ポート ${PORT}`);
+});
 
 // 接続中のソケットを friendCode で引けるように管理
 // 同じ人が複数端末で開いている可能性も考え、1つのfriendCodeに複数ソケットを許容する
@@ -323,6 +478,45 @@ wss.on('connection', (ws) => {
         targetSockets.forEach((sock) => sendJSON(sock, data));
       } else {
         // 💡 相手がオフラインならキューに保存しておき、次にidentifyしてきた時に配信する
+        if (!store.dmQueues[data.dmTarget]) {
+          store.dmQueues[data.dmTarget] = [];
+        }
+        store.dmQueues[data.dmTarget].push(data);
+        scheduleSave();
+      }
+      return;
+    }
+
+    // ─── 💰 gift_gold：フレンドへのゴールド送金 ───
+    // 🔧【修正】以前はこのmessageTypeに対応するハンドラが無く、⑧の「同じ部屋の相手にだけ送る」
+    // フォールバックに落ちていた。送金は対戦中の部屋（roomId）の外（掲示板画面など）から行われるため
+    // ws.roomIdが無く、結果的にどこにも送られずメッセージが握りつぶされていた（送金が届かない不具合）。
+    // dm_chatと同じ「オンラインなら即配信、オフラインならキューに保存して次回配信」の方式にする。
+    if (data.messageType === 'gift_gold' && data.dmTarget) {
+      const targetSockets = socketsByFriendCode.get(data.dmTarget);
+      const targetIsOnline = targetSockets && targetSockets.size > 0;
+
+      if (targetIsOnline) {
+        targetSockets.forEach((sock) => sendJSON(sock, data));
+      } else {
+        if (!store.dmQueues[data.dmTarget]) {
+          store.dmQueues[data.dmTarget] = [];
+        }
+        store.dmQueues[data.dmTarget].push(data);
+        scheduleSave();
+      }
+      return;
+    }
+
+    // ─── 🏅 award_badge：開発者からの大会バッジ授与 ───
+    // 🔧【修正】gift_goldと同じ理由で、以前はどこにも届かなかった不具合を同様に修正
+    if (data.messageType === 'award_badge' && data.dmTarget) {
+      const targetSockets = socketsByFriendCode.get(data.dmTarget);
+      const targetIsOnline = targetSockets && targetSockets.size > 0;
+
+      if (targetIsOnline) {
+        targetSockets.forEach((sock) => sendJSON(sock, data));
+      } else {
         if (!store.dmQueues[data.dmTarget]) {
           store.dmQueues[data.dmTarget] = [];
         }
@@ -513,6 +707,45 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    // ─── ⚔️ raid_join：レイドバトルのキューに参加する ───
+    if (data.messageType === 'raid_join' && data.senderFriendCode) {
+      removeFromRaidQueue(ws); // 二重登録防止
+      ws.raidRoomId = null;
+      raidQueue.push({
+        ws,
+        friendCode: data.senderFriendCode,
+        name: data.playerName || '名無し',
+        joinedAt: Date.now()
+      });
+      attemptRaidMatchmaking();
+      return;
+    }
+
+    // ─── ⚔️ raid_leave：レイド待機列から抜ける（まだ部屋が始まっていない間だけ有効） ───
+    if (data.messageType === 'raid_leave') {
+      removeFromRaidQueue(ws);
+      return;
+    }
+
+    // ─── ⚔️ raid_attack：ボスに攻撃する。ダメージ量はサーバー側で決定し、クライアントの自己申告は信用しない ───
+    if (data.messageType === 'raid_attack' && ws.raidRoomId) {
+      const room = raidRooms.get(ws.raidRoomId);
+      if (room && !room.ended) {
+        const member = data.senderFriendCode ? room.members.get(data.senderFriendCode) : null;
+        const now = Date.now();
+        if (member && member.alive && now - member.lastAttackAt >= RAID_ATTACK_COOLDOWN_MS) {
+          member.lastAttackAt = now;
+          const damage = 8 + Math.floor(Math.random() * 10); // 🔧 ダメージ量はサーバーが決める（チート対策）
+          room.bossHp = Math.max(0, room.bossHp - damage);
+          broadcastRaidState(ws.raidRoomId);
+          if (room.bossHp <= 0) {
+            endRaidRoom(ws.raidRoomId, true);
+          }
+        }
+      }
+      return;
+    }
+
     // ─── ⑧ それ以外（対戦の位置同期・勝敗結果など）は、マッチング済みの「同じ部屋の相手」にだけ送る ───
     // 🔧【修正】以前は接続者全員へブロードキャストしていたため、3人以上が同時にオンライン対戦を
     // 開始すると、無関係な相手の操作情報が混ざってしまう問題があった。マッチメイキング導入に伴い、
@@ -529,5 +762,22 @@ wss.on('connection', (ws) => {
     unregisterSocket(ws);
     removeFromQueue(ws);
     leaveRoom(ws);
+    removeFromRaidQueue(ws);
+    // ⚔️ レイド中に切断した場合、そのメンバーを「戦闘不能」扱いにして部屋に残す
+    // （即座に部屋ごと消すと、残りのメンバーが理不尽に全滅扱いになってしまうため）
+    if (ws.raidRoomId && raidRooms.has(ws.raidRoomId)) {
+      const room = raidRooms.get(ws.raidRoomId);
+      const member = Array.from(room.members.values()).find((m) => m.ws === ws);
+      if (member) {
+        member.alive = false;
+        member.hp = 0;
+        const stillAnyoneAlive = Array.from(room.members.values()).some((m) => m.alive);
+        if (!stillAnyoneAlive) {
+          endRaidRoom(ws.raidRoomId, false);
+        } else {
+          broadcastRaidState(ws.raidRoomId);
+        }
+      }
+    }
   });
 });
